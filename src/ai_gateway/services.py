@@ -15,7 +15,7 @@ from ai_gateway.config import LoadedConfig
 from ai_gateway.observability import Telemetry, setup_telemetry
 from ai_gateway.policy import PolicyEngine
 from ai_gateway.proxy import Proxy, build_http_client
-from ai_gateway.ratelimit import MemoryStateStore, RateLimiter, StateStore
+from ai_gateway.ratelimit import IpRateLimiter, MemoryStateStore, RateLimiter, StateStore
 
 log = logging.getLogger(__name__)
 
@@ -28,6 +28,7 @@ class Services:
     policy: PolicyEngine
     store: StateStore
     limiter: RateLimiter
+    ip_limiter: IpRateLimiter  # pre-auth, per source IP
     proxy: Proxy
     jwks_http: httpx.AsyncClient  # used only for IdP/JWKS calls
     upstream_http: httpx.AsyncClient  # used only for upstream calls
@@ -76,6 +77,13 @@ def build_services(
     validator = TokenValidator(gw.idps, jwks, tel)
     policy = PolicyEngine(config.policy)
     limiter = RateLimiter(state, tel, clock=clock, sleep=sleep, on_error=gw.defaults.on_limiter_error)
+    ip_limiter = IpRateLimiter(gw.server.ip_rate_limit, clock=clock)
+    if gw.defaults.unknown_clients == "default_limits":
+        log.warning(
+            "defaults.unknown_clients=default_limits admits ANY valid token from a trusted IdP "
+            "(fail-open); register clients in clients.yaml and use 'deny' in production",
+            extra={"event": "startup.unknown_clients_open"},
+        )
     proxy = Proxy(config.policy, up, tel, gw.defaults, max_request_bytes=gw.server.max_body_bytes)
     try:
         proxy.validate_credentials()
@@ -91,6 +99,7 @@ def build_services(
         policy=policy,
         store=state,
         limiter=limiter,
+        ip_limiter=ip_limiter,
         proxy=proxy,
         jwks_http=jwks,
         upstream_http=up,

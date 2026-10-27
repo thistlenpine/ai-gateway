@@ -6,6 +6,15 @@ server:
   trust_forwarded_for: false
   # Only peers listed here may set X-Forwarded-*; REQUIRED when trust_forwarded_for is true ("*" is refused).
   trusted_proxies: [10.0.0.0/8]
+  # Pre-auth per-IP token bucket (runs before token validation; in-memory, PER INSTANCE).
+  # Behind a load balancer set trust_forwarded_for (above) or every caller shares the LB's IP.
+  # Keep an L7 limiter/WAF in front in production; this is only a backstop.
+  ip_rate_limit:
+    enabled: true
+    requests_per_window: 600
+    window_seconds: 60
+    # burst: 600                      # bucket size (default = requests_per_window)
+    max_tracked_ips: 100000           # memory bound; LRU eviction
 
 idps:
   - name: corp-okta
@@ -18,6 +27,10 @@ idps:
     jwks_min_refresh_interval_s: 30
     client_id_claims: [client_id, azp, sub]
     scope_claims: [scope, scp]
+    max_token_lifetime_s: 86400       # default; no revocation exists, so this bounds a leaked token. 0/null = unbounded
+    # A discovered jwks_uri must be https on the issuer's host unless its host is listed here:
+    # jwks_allowed_hosts: [keys.example.com]
+    # jwks_allow_insecure_local: false  # dev/test only: allow http + loopback IdPs
   - name: machine-keycloak
     issuer: https://sso.example.com/realms/machines
     jwks_uri: https://sso.example.com/realms/machines/protocol/openid-connect/certs
@@ -38,7 +51,7 @@ telemetry:
     stdout: true
 
 defaults:
-  unknown_clients: default_limits     # or: deny
+  unknown_clients: deny               # default. default_limits admits ANY valid token (fail-open, warned at startup)
   upstream_timeout_s: 30
   upstream_connect_timeout_s: 5
   on_limiter_error: fail_open

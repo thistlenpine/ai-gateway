@@ -307,10 +307,13 @@ def write_gateway_config(
 
     (root / "policies").mkdir(parents=True, exist_ok=True)
     gateway = {
-        "server": {"host": "127.0.0.1", "port": port, "max_body_bytes": max_body_bytes},
-        "idps": [{"name": "int", "issuer": ISSUER, "jwks_uri": f"{upstream_url}/idp/jwks.json", "audiences": [AUDIENCE]}],
+        "server": {"host": "127.0.0.1", "port": port, "max_body_bytes": max_body_bytes,
+                   "ip_rate_limit": {"enabled": False}},
+        "idps": [{"name": "int", "issuer": ISSUER, "jwks_uri": f"{upstream_url}/idp/jwks.json", "audiences": [AUDIENCE],
+                  "jwks_allow_insecure_local": True}],
         "telemetry": {"enabled": False, "log_stdout_json": False},
         "defaults": {
+            "unknown_clients": "default_limits",  # these tests mint ad-hoc client ids
             "upstream_timeout_s": 10,
             "rate_limit": {"requests_per_window": 1000, **(limits or {})},
         },

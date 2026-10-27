@@ -308,8 +308,19 @@ async def test_max_token_lifetime_enforced_and_iat_required(http: Any) -> None:
     now = int(time.time())
     with only_failure():
         await v.validate(signed(claims(iat=now, exp=now + 86_400)))
-    with only_failure(AuthFailure.MISSING_CLAIM):
-        await v.validate(signed(claims(iat=None)))
+    await v.validate(signed(claims(iat=None)))  # no iat: exp - now is capped instead
+    with only_failure(AuthFailure.MALFORMED):
+        await v.validate(signed(claims(iat=None, exp=now + 86_400)))
+
+
+async def test_default_lifetime_bound_without_revocation(http: Any) -> None:
+    v = validator([idp()], http)  # default cap: 24 h
+    now = int(time.time())
+    await v.validate(signed(claims(iat=now, exp=now + 80_000)))
+    with only_failure(AuthFailure.MALFORMED):
+        await v.validate(signed(claims(iat=now, exp=now + 30 * 86_400)))
+    with only_failure(AuthFailure.MALFORMED):
+        await v.validate(signed(claims(iat=None, exp=now + 30 * 86_400)))
 
 
 async def test_empty_or_missing_client_id_rejected(http: Any) -> None:

@@ -46,7 +46,8 @@ class TokenValidator:
          audience=idp.audiences, issuer=idp.issuer, leeway=idp.leeway_s,
          options require exp (+iss, aud); nbf/iat verified if present.
       4. Extract client_id via idp.client_id_claims (first present), scopes via
-         idp.scope_claims (space-separated string or list), enforce idp.max_token_lifetime_s.
+         idp.scope_claims (space-separated string or list), enforce idp.max_token_lifetime_s
+         (exp - iat; exp - now when iat is absent; default 86400, 0/null = unbounded).
       5. Return Principal; is_client_credentials = (sub == client_id) or no end-user claim.
     Map every PyJWT exception to AuthFailure (never leak exception text or token fragments).
     Records telemetry.record_auth_failure on failure and starts SPAN_AUTHN-child spans only
@@ -192,10 +193,11 @@ class TokenValidator:
             if value > now + leeway:
                 raise AuthenticationError(AuthFailure.NOT_YET_VALID)
         if idp.max_token_lifetime_s is not None:
+            # No revocation exists, so bound the lifetime. Without `iat` the best available bound
+            # is the remaining lifetime (exp - now): a token minted with a far-future exp is refused.
             iat = claims.get("iat")
-            if iat is None:
-                raise AuthenticationError(AuthFailure.MISSING_CLAIM)
-            if exp - iat > idp.max_token_lifetime_s:
+            lifetime = exp - iat if iat is not None else exp - now
+            if lifetime > idp.max_token_lifetime_s:
                 raise AuthenticationError(AuthFailure.MALFORMED)
 
     @staticmethod

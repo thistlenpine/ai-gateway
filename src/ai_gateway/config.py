@@ -38,6 +38,16 @@ class _Strict(BaseModel):
 # --------------------------------------------------------------------------- gateway.yaml
 
 
+class IpLimitConfig(_Strict):
+    """Cheap per-IP token bucket applied BEFORE token validation (in-memory, per instance)."""
+
+    enabled: bool = True
+    requests_per_window: int = Field(600, gt=0)  # sustained rate
+    window_seconds: float = Field(60.0, gt=0)
+    burst: int | None = Field(None, gt=0)  # bucket size; None -> requests_per_window
+    max_tracked_ips: int = Field(100_000, ge=100)  # memory bound; LRU eviction beyond this
+
+
 class ServerConfig(_Strict):
     host: str = "0.0.0.0"
     port: int = 8080
@@ -46,6 +56,10 @@ class ServerConfig(_Strict):
     # Peers (IPs/CIDRs) whose X-Forwarded-* headers uvicorn may trust. Required when
     # trust_forwarded_for is true; "*" is refused (SEC-16).
     trusted_proxies: list[str] = Field(default_factory=list)
+    # Pre-authentication limiter keyed on the client IP (the one uvicorn derived, i.e. honouring
+    # trust_forwarded_for/trusted_proxies). Behind a proxy without trust_forwarded_for every caller
+    # shares the proxy's IP: enable forwarding, raise the limit or set `enabled: false`.
+    ip_rate_limit: IpLimitConfig = Field(default_factory=IpLimitConfig)
 
     @field_validator("trusted_proxies")
     @classmethod
@@ -84,7 +98,20 @@ class IdPConfig(_Strict):
     http_timeout_s: float = 5.0
     client_id_claims: list[str] = Field(default_factory=lambda: ["client_id", "azp", "sub"])
     scope_claims: list[str] = Field(default_factory=lambda: ["scope", "scp"])  # str (space) or list
-    max_token_lifetime_s: int | None = None  # reject tokens with exp - iat larger than this
+    # Reject tokens whose lifetime is longer than this: exp - iat, or exp - now when `iat` is absent.
+    # There is no revocation list, so this bounds how long a leaked token stays usable. 0 or null
+    # = unbounded (explicit opt-in; not recommended).
+    max_token_lifetime_s: int | None = Field(86_400, ge=0)
+    # Hosts (besides the issuer's own) a *discovered* jwks_uri may point at. Exact, case-insensitive.
+    jwks_allowed_hosts: list[Annotated[str, Field(min_length=1)]] = Field(default_factory=list)
+    # Test/dev opt-in: allow plain http and loopback/link-local/metadata addresses for the issuer
+    # and JWKS endpoints. Never enable in production.
+    jwks_allow_insecure_local: bool = False
+
+    @field_validator("max_token_lifetime_s")
+    @classmethod
+    def _zero_is_unbounded(cls, v: int | None) -> int | None:
+        return None if v == 0 else v
 
     @field_validator("issuer")
     @classmethod
@@ -160,7 +187,9 @@ class LimitPolicy(_Strict):
 
 class DefaultsConfig(_Strict):
     rate_limit: LimitPolicy = Field(default_factory=LimitPolicy)
-    unknown_clients: Literal["default_limits", "deny"] = "default_limits"
+    # "deny": a valid token whose client_id is not in clients.yaml gets 403. "default_limits" admits
+    # any valid token from a trusted IdP with defaults.rate_limit (fail-open; warned at startup).
+    unknown_clients: Literal["default_limits", "deny"] = "deny"
     upstream_timeout_s: float = 30.0
     upstream_connect_timeout_s: float = 5.0
     on_limiter_error: Literal["fail_open", "fail_closed"] = "fail_open"

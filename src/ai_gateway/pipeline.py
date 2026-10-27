@@ -5,6 +5,8 @@ the error responder, which still records metrics + access log):
 
   0 request-id    done by app.RequestContextMiddleware: RequestContext bound to a ContextVar,
                   X-Request-ID echoed on every response. The pipeline does add_active(+1).
+  0b ip limit     services.ip_limiter.check(ctx.client_ip) -> 429 `ip_rate_limited` (+Retry-After)
+                  BEFORE any token work (cheap pre-auth flood backstop; per instance)
   1 authn         extract_bearer -> validator.validate -> ctx.principal, ctx.client_label
                   (unregistered/disabled client + defaults.unknown_clients=="deny" -> 403)
   1b block-check  limiter.is_blocked(client_id) -> 429 `client_blocked` BEFORE reading the body
@@ -49,6 +51,7 @@ from ai_gateway.errors import (
 from ai_gateway.models import (
     DecisionReason,
     LimitDecision,
+    LimitScope,
     Phase,
     PolicyDecision,
     Principal,
@@ -147,6 +150,7 @@ class GatewayPipeline:
 
     async def _run(self, request: Request, ctx: RequestContext, st: _Accounting) -> Response:
         s = self._s
+        self._ip_limit(ctx)  # 0: cheap pre-auth limiter, before any token work
         principal = await self._authenticate(request, ctx)
         client_id = ctx.limit_key  # namespaced by IdP (+ subject for end-user tokens): SEC-08
         limits = s.config.limits_for(principal.client_id, principal.issuer)
@@ -218,6 +222,29 @@ class GatewayPipeline:
         except BaseException:
             await presp.aclose()
             raise
+
+    def _ip_limit(self, ctx: RequestContext) -> None:
+        wait = self._s.ip_limiter.check(ctx.client_ip)
+        if wait is None:
+            return
+        cfg = self._s.config.gateway.server.ip_rate_limit
+        decision = LimitDecision(
+            phase=Phase.REJECT,
+            scope=LimitScope.IP,
+            client_id="ip",  # never the address itself: bounded metric labels, no PII in metrics
+            limit=cfg.requests_per_window,
+            remaining=0,
+            reset_s=wait,
+            retry_after_s=wait,
+            window_s=cfg.window_seconds,
+            reason="ip_rate_limited",
+        )
+        self._s.telemetry.record_rate_limit(decision, ctx)
+        raise RateLimitedError(
+            "Rate limit exceeded",
+            code="ip_rate_limited",
+            headers={"Retry-After": self._s.ip_limiter.retry_after_header(wait)},
+        )
 
     async def _charge_denial(self, ctx: RequestContext, limits: LimitPolicy, err: GatewayError) -> None:
         """Count a denied/malformed request against the limiter without ever sleeping."""

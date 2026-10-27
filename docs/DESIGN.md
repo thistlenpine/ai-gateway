@@ -31,6 +31,7 @@ Only `observability/otel.py` imports the OTel SDK; everyone else uses the `Telem
 | # | Stage | Span | What happens | Failure |
 |---|-------|------|--------------|---------|
 | 0 | request-id | (server span from FastAPI instrumentation) | accept inbound `X-Request-ID` if `^[A-Za-z0-9._-]{8,128}$` else uuid4; bind `RequestContext` to ContextVar; `trace_id` from active span; `requests.active +1`; echo header on every response | - |
+| 0b | ip limit | (in request span) | `ip_limiter.check(client_ip)`: in-memory token bucket per IP (`server.ip_rate_limit`), before any token work | 429 `ip_rate_limited` + `Retry-After` |
 | 1 | authn | `gateway.authn` | `Authorization: Bearer` -> `TokenValidator.validate` -> `Principal`; client label for metrics (registered id / `unregistered`) | 401 `invalid_token` (+`WWW-Authenticate`), 503 `idp_unavailable`, 403 if `unknown_clients: deny` |
 | 1b | block check | (in `gateway.ratelimit`) | `limiter.is_blocked(client_id)` before reading body or touching policy | 429 `client_blocked` + `Retry-After` |
 | 2 | authz | `gateway.authz` | normalize path; `resolve_route`; buffer body for MCP/LLM (<= `max_body_bytes`); `adapter.classify` -> `Resource[]`; `authorize_all`; audit event (allow and deny) | 403 `access_denied` (identical body for all reasons), 400 malformed, 413 too large |
@@ -39,7 +40,7 @@ Only `observability/otel.py` imports the OTel SDK; everyone else uses the `Telem
 | 5 | accounting | `gateway.accounting` | after body completes/aborts: reconcile tokens, token + request metrics, access log | never alters the response |
 
 Notes:
-- Authz runs before rate limiting so denied probes do not consume quota; the cost is that a client can spam 403s freely. Mitigation (v1): every deny is audited and counted in `gateway.authz.decisions`; (v2) count denies against a separate small limiter bucket.
+- Authz runs before rate limiting, but every denied/malformed authenticated request is charged to the client's window afterwards (`_charge_denial`, never delayed), so a client cannot spam 403s freely. Denials, granted requests and unknown routes cost the same, so the 403-vs-429 a caller sees depends on volume only (tested matrix in `tests/e2e/test_e2e_hardening.py`).
 - Path normalization (`policy.matchers.normalize_path`) happens once; the proxy forwards the normalized path so authz and upstream always agree (no `..`/`%2f`/`//` bypass).
 - Allowed responses carry `RateLimit-Limit/Remaining/Reset/Policy` headers from the request-scope decision.
 - Client disconnect: cancel -> `ProxyResponse.aclose()`, release any delay slot, reconcile tokens with `actual=0` unless usage was already observed.
@@ -48,8 +49,8 @@ Notes:
 
 - Multiple IdPs; selected by **exact** match of unverified `iss` against `idps[].issuer`. No `jku/x5u/jwk` header is ever honored; JWKS URL comes only from config or OIDC discovery of the configured issuer (discovered `issuer` must equal configured).
 - Algorithm allow-list per IdP (default RS256/ES256/PS256). Config validation forbids `none` and `HS*`; the validator re-checks and requires key type to match alg family, closing the HS/RS key-confusion hole.
-- Required: signature, `exp` (+ `leeway_s`), `iss`, `aud` (intersects `audiences`); `nbf`/`iat` checked if present; optional `max_token_lifetime_s`.
-- JWKS cache: per IdP, keyed by `kid`, TTL `jwks_cache_ttl_s`, single-flight refresh, unknown `kid` => at most one forced refresh per `jwks_min_refresh_interval_s`, stale-if-error for `jwks_stale_if_error_s`, `/readyz` reflects cache state.
+- Required: signature, `exp` (+ `leeway_s`), `iss`, `aud` (intersects `audiences`); `nbf`/`iat` checked if present; `max_token_lifetime_s` (default 86400; `exp - iat`, or `exp - now` when `iat` is absent; 0/null = unbounded opt-in; the only mitigation for a leaked token since there is no revocation).
+- JWKS cache: per IdP, keyed by `kid`, TTL `jwks_cache_ttl_s`, single-flight refresh, `kid` selects only keys whose kty/alg fit the token; a token without `kid` needs exactly one fitting key and never forces a refresh; unknown `kid` => at most one forced refresh per `jwks_min_refresh_interval_s`, stale-if-error for `jwks_stale_if_error_s`, `/readyz` reflects cache state. Fetches are streamed with a 1 MB cap; endpoints must be https, a discovered `jwks_uri` must be on the issuer host or in `jwks_allowed_hosts`, and loopback/link-local/metadata hosts are refused unless `jwks_allow_insecure_local` (dev/test).
 - Client credentials: no special grant handling at the gateway (the IdP issues the token). `client_id` = first present of `client_id_claims` (default `client_id`, `azp`, `sub`); `is_client_credentials = (sub == client_id)`. Scopes from `scope` (space string) or `scp` (list).
 - `Principal` never contains the raw token; `claims` holds only an allow-listed subset.
 
@@ -90,7 +91,7 @@ Counting: sliding-window counter (current + previous fixed bucket weighted) of *
 Sustained-abuse timer: `set_if_absent(abuse_since)` when `ratio >= block_at`; cleared when ratio drops below. `block_sustained_seconds: 0` blocks immediately.
 Token quota (LLM): separate fixed-window counter over `token_window_seconds`; pre-flight `reserve_tokens(estimate)` where `estimate = ceil(prompt_chars/4) + max_tokens` (default 1024); on overflow roll back and 429 `token_quota_exceeded`; after the response `reconcile_tokens(estimate, actual)` using upstream `usage` (Anthropic `usage.input/output_tokens`; OpenAI `prompt/completion_tokens`, with `stream_options.include_usage` injected). Token scope never delays and never triggers a block.
 Store failure: `defaults.on_limiter_error` (`fail_open` default: allow + log + metric; `fail_closed`: 429).
-Unknown clients get `defaults.rate_limit` (or 403 when `unknown_clients: deny`). The in-memory store is per-process; run a single instance until a Redis `StateStore` exists.
+Unknown clients get 403 (`unknown_clients: deny`, the default) or, with the fail-open opt-in `default_limits`, `defaults.rate_limit` (startup warning). Before authn, `server.ip_rate_limit` (token bucket per client IP, in-memory, bounded) answers 429 `ip_rate_limited`. All limiter state is per-process: N replicas multiply every limit by up to N; run a single instance (or divide the limits) until a Redis `StateStore` exists.
 
 ## 7. Proxy (`proxy/`)
 

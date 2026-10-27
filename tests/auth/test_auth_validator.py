@@ -340,8 +340,25 @@ async def test_max_token_lifetime(http: httpx.AsyncClient, tel: RecTelemetry, jw
     v = validator(http, tel, max_token_lifetime_s=600)
     await v.validate(KP.mint(ttl=500))
     assert await fails(v, KP.mint(ttl=3600)) is AuthFailure.MALFORMED
-    t = jwt.encode(claims(), KP.private, algorithm="RS256", headers={"kid": "k1"})  # no iat
-    assert await fails(v, t) is AuthFailure.MISSING_CLAIM
+    # No iat: fall back to capping exp - now (not MISSING_CLAIM)
+    t = jwt.encode(claims(), KP.private, algorithm="RS256", headers={"kid": "k1"})
+    await v.validate(t)
+    far = jwt.encode(
+        claims(exp=int(time.time()) + 3600), KP.private, algorithm="RS256", headers={"kid": "k1"}
+    )
+    assert await fails(v, far) is AuthFailure.MALFORMED
+
+
+async def test_default_lifetime_cap_is_one_day_and_zero_or_null_opt_out(
+    http: httpx.AsyncClient, tel: RecTelemetry, jwks_route: Any
+) -> None:
+    assert make_idp().max_token_lifetime_s == 86_400
+    assert make_idp(max_token_lifetime_s=0).max_token_lifetime_s is None
+    assert make_idp(max_token_lifetime_s=None).max_token_lifetime_s is None
+    week = 7 * 86_400
+    assert await fails(validator(http, tel), KP.mint(ttl=week)) is AuthFailure.MALFORMED
+    for opt_out in (0, None):
+        await validator(http, tel, max_token_lifetime_s=opt_out).validate(KP.mint(ttl=week))
 
 
 async def test_multiple_idps_selected_by_issuer(http: httpx.AsyncClient, tel: RecTelemetry) -> None:

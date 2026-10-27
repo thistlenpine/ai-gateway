@@ -229,7 +229,7 @@ async def test_insecure_jwks_uri_rejected_but_localhost_allowed() -> None:
         with pytest.raises(AuthenticationError):
             await cache.get_key("k1", "RS256")
         assert not r.called
-    cache2, _, _, client2 = _setup(jwks_uri="http://localhost:9000/jwks")
+    cache2, _, _, client2 = _setup(jwks_uri="http://localhost:9000/jwks", jwks_allow_insecure_local=True)
     with respx.mock:
         respx.get("http://localhost:9000/jwks").respond(json=kp.jwks())
         assert await cache2.get_key("k1", "RS256") is not None

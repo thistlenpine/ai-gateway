@@ -34,6 +34,7 @@ class Phase(enum.StrEnum):
 class LimitScope(enum.StrEnum):
     REQUESTS = "requests"
     TOKENS = "tokens"
+    IP = "ip"  # pre-auth per-IP limiter
 
 
 class DecisionReason(enum.StrEnum):

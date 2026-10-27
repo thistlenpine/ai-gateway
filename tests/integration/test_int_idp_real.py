@@ -66,7 +66,12 @@ def idp_env() -> Any:
 def make_validator(srv: ThreadedServer, http: httpx.AsyncClient, **kw: Any) -> TokenValidator:
     """Validator on a fake clock (JWKS min refresh interval is >= 1 s; tests advance `v.clock`)."""
     idp = IdPConfig(
-        name="real", issuer=srv.url, audiences=["ai-gateway"], jwks_min_refresh_interval_s=1, **kw
+        name="real",
+        issuer=srv.url,
+        audiences=["ai-gateway"],
+        jwks_min_refresh_interval_s=1,
+        jwks_allow_insecure_local=True,
+        **kw,
     )
     clock = FakeClock(time.time())
     v = TokenValidator([idp], http, NullTelemetry(), clock=clock, jwks_clock=clock)
@@ -146,7 +151,7 @@ async def test_jwks_endpoint_garbage_and_outage_keep_last_good_keys(idp_env: Any
     async with httpx.AsyncClient(timeout=5, trust_env=False) as http:
         idp = IdPConfig(
             name="real", issuer=srv.url, audiences=["ai-gateway"], jwks_min_refresh_interval_s=1,
-            jwks_cache_ttl_s=10, jwks_stale_if_error_s=3600,
+            jwks_cache_ttl_s=10, jwks_stale_if_error_s=3600, jwks_allow_insecure_local=True,
         )  # fmt: skip
         v = TokenValidator([idp], http, NullTelemetry(), clock=clock, jwks_clock=clock)
         await v.validate(token(kp, srv))

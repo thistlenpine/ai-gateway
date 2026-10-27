@@ -28,12 +28,14 @@ from ai_gateway.config import (
     GatewayConfig,
     HttpGrant,
     IdPConfig,
+    IpLimitConfig,
     LimitPolicy,
     LlmGrant,
     LoadedConfig,
     McpGrant,
     PolicyConfig,
     Rule,
+    ServerConfig,
     TelemetryConfig,
     UpstreamConfig,
     UpstreamCredential,
@@ -112,7 +114,11 @@ def make_config(**limits: Any) -> LoadedConfig:
     gateway = GatewayConfig(
         idps=[IdPConfig(name="test", issuer=ISSUER, jwks_uri=JWKS_URL, audiences=["ai-gateway"])],
         telemetry=TelemetryConfig(),
-        defaults=DefaultsConfig(rate_limit=LimitPolicy(requests_per_window=1000)),
+        # the suite mints ad-hoc client ids (fail-open opt-in); the pre-auth IP limiter has its own tests
+        server=ServerConfig(ip_rate_limit=IpLimitConfig(enabled=False)),
+        defaults=DefaultsConfig(
+            rate_limit=LimitPolicy(requests_per_window=1000), unknown_clients="default_limits"
+        ),
     )
     return LoadedConfig(gateway, policy, clients)
 

@@ -36,7 +36,7 @@ All YAML, `${VAR}` / `${VAR:-default}` expansion on every string; any invalid co
 
 | File | Purpose |
 |------|---------|
-| `gateway.yaml` | `server`, `idps[]`, `telemetry`, `defaults` (rate limit, timeouts, `unknown_clients`, `on_limiter_error`), pointers to the files below |
+| `gateway.yaml` | `server`, `idps[]`, `telemetry`, `server` (incl. `ip_rate_limit`), `defaults` (rate limit, timeouts, `unknown_clients` = `deny`, `on_limiter_error`), pointers to the files below |
 | `policies/*.yaml` | `upstreams` (kind `http`/`mcp`/`llm`, `base_url`, public `prefix`, optional `credential: {env, header, scheme}`) and scope `rules` |
 | `clients.yaml` | per-client overrides of the rate-limit policy (`requests_per_window`, `tokens_per_window`, ...) |
 
@@ -47,7 +47,7 @@ clamp). Any matching deny rule wins. Unknown prefixes are denied.
 
 ## Request pipeline and phases
 
-`request-id -> authn -> block check -> authz -> rate limit -> proxy -> accounting`
+`request-id -> ip limit -> authn -> block check -> authz -> rate limit -> proxy -> accounting`
 
 Rate limiting is per `client_id` over a sliding window of **all attempts**; `ratio = attempts / requests_per_window`:
 
@@ -57,8 +57,30 @@ Rate limiting is per `client_id` over a sliding window of **all attempts**; `rat
 
 LLM routes also reserve `estimate = ceil(prompt_chars/4) + max_tokens` against `tokens_per_window`
 (`429 token_quota_exceeded`) and reconcile with the provider-reported usage afterwards (refund
-when the upstream fails). State is in-memory per process (`StateStore` interface; Redis later) -
-run a single instance for now.
+when the upstream fails).
+
+**Rate limits are per instance.** All limiter state (per-client windows, blocks, token quotas,
+concurrency slots and the per-IP limiter) lives in process memory (`StateStore` interface; Redis
+later). With N replicas behind a load balancer every limit is effectively multiplied by up to N
+(and a block only applies on the replica that issued it): divide `requests_per_window` /
+`tokens_per_window` / `ip_rate_limit` by the replica count, or run a single instance, until a
+shared store exists.
+
+### Pre-auth per-IP limiter
+
+Before any token work (so floods of garbage/expired tokens cannot burn CPU, audit volume or JWKS
+traffic) every request passes a cheap in-memory token bucket keyed on the client IP: default
+`server.ip_rate_limit` = 600 requests/min/IP with a burst of 600. Over the limit: `429
+ip_rate_limited` with `Retry-After`, counted in `gateway.ratelimit.decisions{scope="ip"}`
+(the address is never a metric label). Memory is bounded (`max_tracked_ips`, LRU; IPv6 collapses
+to /64). `/healthz` and `/readyz` are exempt. Configure or disable with `server.ip_rate_limit`
+(`enabled: false`).
+
+The IP is the one uvicorn derives: the TCP peer, or `X-Forwarded-For` only when
+`server.trust_forwarded_for` is set for peers in `server.trusted_proxies`. **Behind a load
+balancer without `trust_forwarded_for`, every caller shares the balancer's IP**: enable
+forwarding, raise the limit or disable the limiter. This limiter is a backstop, not a WAF: in
+production still put an L7 rate limiter / WAF / DDoS protection in front of the gateway.
 
 ## Observability
 
@@ -74,8 +96,11 @@ headers come from the env var named in `telemetry.otlp.headers_env`.
 ## Security model
 
 - Tokens: exact-`iss` IdP selection, asymmetric algorithms only (`none`/`HS*` rejected), required `exp`/`iss`/`aud`, JWKS only from config/discovery of the configured issuer, rate-limited key refresh, stale-if-error.
+- Token lifetime: there is no revocation list, so `idps[].max_token_lifetime_s` (default **86400**) rejects tokens whose lifetime is longer: `exp - iat`, or `exp - now` when `iat` is absent. `0`/`null` disables the bound (explicit opt-in, not recommended); prefer short-lived tokens and rotate signing keys to cut off a leaked token.
+- Unknown clients: `defaults.unknown_clients` defaults to **`deny`** (a valid token whose `client_id` is not in `clients.yaml` gets 403). `default_limits` admits any valid token from a trusted IdP and logs a startup warning.
+- JWKS fetching: a `kid` selects only keys whose `kty`/`alg` fit the token (a duplicate `kid` across RSA/EC is fine); a token without `kid` is only accepted when exactly one key fits and never forces a refresh. Responses are streamed and capped at 1 MB (up-front `Content-Length` check, read aborted at the cap). Endpoints must be `https`; a discovered `jwks_uri` must be on the issuer's host or in `idps[].jwks_allowed_hosts`; hosts that are or resolve to loopback/link-local/metadata addresses (169.254.169.254, `fe80::`, ...) are refused. Local `http` IdPs for dev/tests need `idps[].jwks_allow_insecure_local: true`. (DNS can still change between the check and the connect; redirects are never followed and fetches are rate limited.)
 - Default deny at every layer; the client always gets the same `403 access_denied` body - the reason and missing scopes go to the audit stream only.
 - The caller's token is never logged, traced, put in metrics/audit, or forwarded; the gateway authenticates to upstreams with its own credentials (env vars). Identity reaches upstreams via `X-Gateway-*` headers, and inbound `X-Gateway-*`/hop-by-hop/cookie headers are stripped.
 - Paths are normalized once (encoded slashes, `..`, NUL rejected) and the same path is forwarded. Upstream URLs come only from config; redirects are not followed.
 - Body limits (`server.max_body_bytes`, 413), per-upstream timeouts, error bodies carry no internals (`{"error": {"code", "message", "request_id"}}`).
-- Known limits: per-process rate-limit state; a client can send 403-producing requests freely (they are audited and counted, not rate limited); `X-Forwarded-For` is trusted only with `server.trust_forwarded_for`.
+- Known limits: per-instance rate-limit state (see above); no token revocation (bounded by `max_token_lifetime_s`); denied/malformed requests are audited and count against the caller's window, so the 403/429 a caller sees leaks nothing about which routes or scopes exist; `X-Forwarded-For` is trusted only with `server.trust_forwarded_for`.

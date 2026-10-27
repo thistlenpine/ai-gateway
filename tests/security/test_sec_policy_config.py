@@ -365,7 +365,9 @@ def test_secure_defaults() -> None:
     }
     assert g.idps[0].leeway_s <= 60
     assert g.server.max_body_bytes <= 10_000_000
-    assert g.idps[0].max_token_lifetime_s is None  # informational: no lifetime cap unless configured
+    assert g.idps[0].max_token_lifetime_s == 86_400  # no revocation: lifetime bounded by default
+    assert g.defaults.unknown_clients == "deny"  # fail closed: clients must be registered
+    assert g.server.ip_rate_limit.enabled
     with pytest.raises(ValueError):
         LimitPolicy(requests_per_window=0)
     with pytest.raises(ValueError):
@@ -449,11 +451,6 @@ def test_deployment_artifacts_are_not_root_and_do_not_ship_secrets() -> None:
     assert ".env" in gi and "*.pem" in gi and "*.key" in gi
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="SEC-21 dependencies are lower-bounded only ('>=') and no lockfile / hash pinning / audit step exists "
-    "although DESIGN s10 requires pinned versions (pyproject.toml, .github/workflows/ci.yml)",
-)
 def test_dependencies_are_pinned_or_locked() -> None:
     py = (ROOT / "pyproject.toml").read_text()
     deps = re.findall(r'"([A-Za-z0-9_.\[\]-]+)(>=|==|~=)', py)

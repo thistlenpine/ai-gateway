@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
+import socket
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
@@ -70,11 +72,33 @@ class _Key:
     key: Any
 
 
-def _https_or_local(url: str) -> bool:
-    parts = urlsplit(url)
-    if parts.scheme == "https" and parts.hostname:
-        return True
-    return parts.scheme == "http" and parts.hostname in _LOCAL_HOSTS
+_METADATA_ADDRS = frozenset(
+    ipaddress.ip_address(a) for a in ("169.254.169.254", "fd00:ec2::254", "100.100.100.200")
+)
+
+
+def _is_local_host(host: str) -> bool:
+    return host in _LOCAL_HOSTS or host.endswith(".localhost")
+
+
+def _forbidden_address(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Loopback, link-local (incl. 169.254.169.254 / fe80::), unspecified, multicast, reserved and
+    well-known cloud metadata addresses. RFC1918 space is allowed (internal IdPs are normal)."""
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
+    return (
+        addr in _METADATA_ADDRS
+        or addr.is_loopback
+        or addr.is_link_local
+        or addr.is_unspecified
+        or addr.is_multicast
+        or addr.is_reserved
+    )
+
+
+async def _resolve_host(host: str) -> list[str]:
+    infos = await asyncio.get_running_loop().getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    return [str(i[4][0]).split("%", 1)[0] for i in infos]
 
 
 class JWKSCache:
@@ -82,7 +106,12 @@ class JWKSCache:
 
     Rules (all required):
     - jwks_uri from config, else OIDC discovery of `{issuer}/.well-known/openid-configuration`
-      (discovered `issuer` must equal config issuer exactly; https required unless localhost).
+      (discovered `issuer` must equal config issuer exactly; the discovered jwks_uri must be https
+      and its host the issuer's or in idp.jwks_allowed_hosts). Every endpoint must be https and
+      must not be/resolve to loopback, link-local or metadata addresses; http + loopback is only
+      possible with the explicit idp.jwks_allow_insecure_local opt-in (tests/dev).
+    - Responses are streamed: oversize Content-Length is refused up front and the read aborts
+      once MAX_JWKS_BYTES is exceeded.
     - Cache keyed by `kid`; TTL = idp.jwks_cache_ttl_s; refresh is single-flight (asyncio.Lock).
     - Unknown `kid` triggers ONE forced refresh, rate-limited to idp.jwks_min_refresh_interval_s
       (a flood of bogus kids must not hammer the IdP); still unknown -> AuthFailure.UNKNOWN_KID.
@@ -103,8 +132,10 @@ class JWKSCache:
         telemetry: Telemetry,
         *,
         clock: Callable[[], float] = time.monotonic,
+        resolver: Callable[[str], Awaitable[list[str]]] = _resolve_host,
     ) -> None:
         self.idp = idp
+        self._resolver = resolver
         self._http = http
         self._telemetry = telemetry
         self._clock = clock
@@ -131,6 +162,10 @@ class JWKSCache:
             fresh = self._is_fresh()
 
         found = self._lookup(kid, alg)
+        if found is None and kid is None and self._ambiguous_no_kid(alg):
+            raise AuthenticationError(AuthFailure.UNKNOWN_KID)  # fail fast: no refresh can fix it
+        if found is None and kid is not None and self._kid_known_but_incompatible(kid):
+            raise AuthenticationError(AuthFailure.ALG_NOT_ALLOWED)
         if found is None:
             # Possible key rotation. Rate limited by the min refresh interval; a refresh that
             # just happened in this call counts as the attempt, so no second fetch occurs.
@@ -140,10 +175,10 @@ class JWKSCache:
             fresh = self._is_fresh()
             found = self._lookup(kid, alg)
             if found is None:
+                if kid is not None and self._kid_known_but_incompatible(kid):
+                    raise AuthenticationError(AuthFailure.ALG_NOT_ALLOWED)
                 raise AuthenticationError(AuthFailure.UNKNOWN_KID)
 
-        if not self._compatible(found, alg):
-            raise AuthenticationError(AuthFailure.ALG_NOT_ALLOWED)
         if fresh:
             self._telemetry.record_jwks_refresh(issuer=self.idp.issuer, outcome="hit")
         else:
@@ -185,14 +220,19 @@ class JWKSCache:
         return bool(self._keys) and age is not None and age <= limit
 
     def _lookup(self, kid: str | None, alg: str) -> _Key | None:
-        kty = kty_for_alg(alg)
-        if kid is not None:
-            for k in self._keys:
-                if k.kid == kid:
-                    return k
-            return None
-        candidates = [k for k in self._keys if k.kty == kty and k.alg in (None, alg)]
-        return candidates[0] if len(candidates) == 1 else None
+        """Key for (kid, alg). With a kid: kid AND kty/alg compatibility (a duplicate kid across
+        RSA/EC must resolve to the compatible key). Without: exactly one compatible key."""
+        candidates = [k for k in self._keys if self._compatible(k, alg) and (kid is None or k.kid == kid)]
+        if kid is None:
+            return candidates[0] if len(candidates) == 1 else None
+        return candidates[0] if candidates else None
+
+    def _ambiguous_no_kid(self, alg: str) -> bool:
+        """No-kid token and several compatible keys: a refresh cannot make this unambiguous."""
+        return sum(1 for k in self._keys if self._compatible(k, alg)) > 1
+
+    def _kid_known_but_incompatible(self, kid: str) -> bool:
+        return any(k.kid == kid for k in self._keys)
 
     @staticmethod
     def _compatible(k: _Key, alg: str) -> bool:
@@ -229,20 +269,69 @@ class JWKSCache:
             self._fetched_at = self._clock()
             self._telemetry.record_jwks_refresh(issuer=self.idp.issuer, outcome="refreshed")
 
-    async def _get_json(self, url: str) -> dict[str, Any]:
+    def _check_scheme(self, url: str) -> str:
+        """Hostname of an acceptable endpoint URL, else _FetchError. https always; plain http only
+        to a loopback name and only with the explicit jwks_allow_insecure_local opt-in."""
+        parts = urlsplit(url)
+        host = (parts.hostname or "").lower()
+        if not host or parts.username is not None or parts.password is not None:
+            raise _FetchError("bad url")
+        if parts.scheme == "https":
+            return host
+        if parts.scheme == "http" and self.idp.jwks_allow_insecure_local and _is_local_host(host):
+            return host
+        raise _FetchError("insecure url")
+
+    async def _check_address(self, host: str) -> None:
+        """Refuse hosts that are, or resolve to, loopback/link-local/metadata addresses (SSRF).
+        The connection re-resolves, so a DNS-rebinding race remains; fetches are rate limited and
+        redirects are never followed. An unresolvable host just fails at connect time."""
+        if self.idp.jwks_allow_insecure_local:
+            return
+        if _is_local_host(host):
+            raise _FetchError("forbidden host")
         try:
-            resp = await self._http.get(
+            addrs = [ipaddress.ip_address(host)]
+        except ValueError:
+            try:
+                addrs = [ipaddress.ip_address(a) for a in await self._resolver(host)]
+            except (OSError, ValueError):
+                return
+        if any(_forbidden_address(a) for a in addrs):
+            raise _FetchError("forbidden address")
+
+    def _check_discovered_host(self, uri: str) -> None:
+        host = self._check_scheme(uri)
+        allowed = {(urlsplit(self.idp.issuer).hostname or "").lower()}
+        allowed.update(h.lower() for h in self.idp.jwks_allowed_hosts)
+        if host not in allowed:
+            raise _FetchError("jwks_uri host not allowed")
+
+    async def _get_json(self, url: str) -> dict[str, Any]:
+        host = self._check_scheme(url)
+        await self._check_address(host)
+        buf = bytearray()
+        try:
+            async with self._http.stream(
+                "GET",
                 url,
                 timeout=self.idp.http_timeout_s,
                 headers={"Accept": "application/json"},
                 follow_redirects=False,
-            )
+            ) as resp:
+                if resp.status_code != 200:
+                    raise _FetchError(f"status {resp.status_code}")
+                declared = resp.headers.get("content-length", "")
+                if declared.isascii() and declared.isdigit() and int(declared) > MAX_JWKS_BYTES:
+                    raise _FetchError("too large")
+                async for chunk in resp.aiter_bytes():
+                    buf += chunk
+                    if len(buf) > MAX_JWKS_BYTES:
+                        raise _FetchError("too large")  # abort: never buffer the rest
         except httpx.HTTPError as exc:
             raise _FetchError(type(exc).__name__) from None
-        if resp.status_code != 200 or len(resp.content) > MAX_JWKS_BYTES:
-            raise _FetchError(f"status {resp.status_code}")
         try:
-            data = json.loads(resp.content)
+            data = json.loads(bytes(buf))
         except ValueError:
             raise _FetchError("invalid json") from None
         if not isinstance(data, dict):
@@ -252,20 +341,14 @@ class JWKSCache:
     async def _resolve_uri(self) -> str:
         if self._jwks_uri is None:
             base = self.idp.issuer.rstrip("/")
-            if not _https_or_local(base):
-                raise _FetchError("insecure issuer")
             doc = await self._get_json(f"{base}/.well-known/openid-configuration")
             if doc.get("issuer") != self.idp.issuer:
                 raise _FetchError("issuer mismatch")
             uri = doc.get("jwks_uri")
             if not isinstance(uri, str):
                 raise _FetchError("no jwks_uri")
+            self._check_discovered_host(uri)  # never cache an unacceptable discovered URI
             self._jwks_uri = uri
-        if not _https_or_local(self._jwks_uri):
-            self._jwks_uri = self.idp.jwks_uri  # do not cache an unacceptable discovered URI
-            if self._jwks_uri is None or not _https_or_local(self._jwks_uri):
-                self._jwks_uri = None
-                raise _FetchError("insecure jwks_uri")
         return self._jwks_uri
 
     async def _fetch(self) -> list[_Key]:

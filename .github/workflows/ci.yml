@@ -4,29 +4,98 @@ on:
     branches: [main]
   pull_request:
 
+# Least privilege: every job gets a read-only token unless it overrides this.
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_FROZEN: "1" # never re-resolve; fail if uv.lock is stale
+  PYTHON_VERSION: "3.13"
+
 jobs:
+  lock-check:
+    name: lockfiles up to date
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: uv.lock matches pyproject.toml
+        run: uv lock --check
+      - name: requirements*.lock match uv.lock
+        run: |
+          uv export --frozen --format requirements.txt --no-emit-project --no-dev --no-header -o /tmp/requirements.lock
+          uv export --frozen --format requirements.txt --no-emit-project --no-dev --all-extras --no-header -o /tmp/requirements-dev.lock
+          diff -u requirements.lock /tmp/requirements.lock
+          diff -u requirements-dev.lock /tmp/requirements-dev.lock
+
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          python-version: "3.13"
-          cache: pip
-          cache-dependency-path: pyproject.toml
-      - run: pip install -e ".[dev]"
-      - run: ruff check .
-      - run: ruff format --check .
-      - run: mypy src tests
-      - run: pytest -q --timeout=60
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      # hash-verified install from uv.lock; project installed editable, deps untouched
+      - run: uv sync --frozen --all-extras
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run mypy src tests
+      # tests/security and tests/load run in their own job below
+      - run: uv run pytest -q --timeout=60 --ignore=tests/security --ignore=tests/load
+
+  security-load-tests:
+    name: pytest tests/security tests/load
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --frozen --all-extras
+      - run: uv run pytest -q --timeout=120 tests/security tests/load
+
+  pip-audit:
+    name: pip-audit (lockfiles)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      # pip-audit itself is installed from a hash-locked file
+      - run: python -m pip install --require-hashes --no-deps -r .github/requirements-audit.lock
+      # --no-deps/--disable-pip: audit exactly the pinned set, no resolution
+      - run: pip-audit --strict --disable-pip --no-deps -r requirements-dev.lock
+      - run: pip-audit --strict --disable-pip --no-deps -r requirements-build.lock
 
   docker:
     runs-on: ubuntu-latest
-    needs: test
+    needs: [test, security-load-tests]
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
       - run: docker build -t ai-gateway:ci .
