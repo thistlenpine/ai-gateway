@@ -1,0 +1,26 @@
+# Per-client overrides, keyed by client_id (from token claim). Any LimitPolicy field allowed.
+# `issuer` pins a registration to one IdP's issuer (REQUIRED when more than one IdP is configured:
+# a client_id is only unique within its issuer). Rate-limit buckets are always per (IdP, client_id).
+clients:
+  svc-batch:
+    issuer: https://sso.example.com/realms/machines
+    description: nightly batch jobs, bursty
+    limits:
+      requests_per_window: 3000
+      delay_start: 0.9
+      max_delay_ms: 5000
+  agent-prod:
+    issuer: https://sso.example.com/realms/machines
+    description: production agent runtime (MCP + LLM)
+    limits:
+      requests_per_window: 1200
+      tokens_per_window: 400000
+      token_window_seconds: 60
+      block_at: 2.0
+  intern-sandbox:
+    issuer: https://login.example.com/oauth2/default
+    description: low trust
+    limits:
+      requests_per_window: 60
+      tokens_per_window: 20000
+      block_duration_seconds: 900
