@@ -1,0 +1,62 @@
+# Upstreams + scope rules. DEFAULT DENY: nothing is reachable unless a rule grants it.
+# HTTP grant paths are globs on the upstream-relative path (after `prefix`): * = one segment, ** = any depth.
+upstreams:
+  billing:
+    kind: http
+    base_url: http://billing.internal:8080
+    prefix: /billing
+  tools:
+    kind: mcp
+    base_url: http://mcp-tools.internal:9000/mcp
+    prefix: /mcp/tools
+    strip_prefix: true
+    credential: {header: Authorization, scheme: Bearer, env: MCP_TOOLS_TOKEN}
+  anthropic:
+    kind: llm
+    provider: anthropic
+    base_url: https://api.anthropic.com
+    prefix: /llm/anthropic
+    timeout_s: 120
+    credential: {header: x-api-key, scheme: null, env: ANTHROPIC_API_KEY}
+  openai:
+    kind: llm
+    provider: openai
+    base_url: https://api.openai.com
+    prefix: /llm/openai
+    timeout_s: 120
+    credential: {env: OPENAI_API_KEY}
+
+rules:
+  - id: billing-read
+    scopes_any: [billing:read, billing:admin]
+    http:
+      - {upstream: billing, methods: [GET, HEAD], paths: ["/invoices", "/invoices/*", "/customers/**"]}
+  - id: billing-write
+    scopes_all: [billing:write]
+    http:
+      - {upstream: billing, methods: [POST, PUT, PATCH], paths: ["/invoices/**"]}
+  - id: mcp-tools-readonly
+    scopes_any: [mcp:tools:read]
+    mcp:
+      - {upstream: tools, tools: ["search_*", "get_*", "list_*"]}
+  - id: mcp-tools-admin
+    scopes_any: [mcp:tools:admin]
+    mcp:
+      - {upstream: tools, tools: ["*"], methods: [initialize, "notifications/*", ping, tools/list, "resources/*"]}
+  - id: llm-claude
+    scopes_any: [llm:claude]
+    llm:
+      - {upstream: anthropic, models: ["claude-haiku-*", "claude-sonnet-*"], max_tokens_per_request: 8192}
+  - id: llm-claude-premium
+    scopes_all: [llm:claude, llm:premium]
+    llm:
+      - {upstream: anthropic, models: ["claude-opus-*"]}
+  - id: llm-openai-mini
+    scopes_any: [llm:openai]
+    llm:
+      - {upstream: openai, models: ["gpt-*-mini"]}
+  # Explicit deny always wins, regardless of scopes.
+  - id: deny-billing-delete
+    effect: deny
+    http:
+      - {upstream: billing, methods: [DELETE], paths: ["/**"]}

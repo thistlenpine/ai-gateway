@@ -1,0 +1,61 @@
+# gateway.yaml - top-level config. Relative paths resolve against this file's directory.
+server:
+  host: 0.0.0.0
+  port: 8080
+  max_body_bytes: 2000000
+  trust_forwarded_for: false
+  # Only peers listed here may set X-Forwarded-*; REQUIRED when trust_forwarded_for is true ("*" is refused).
+  trusted_proxies: [10.0.0.0/8]
+
+idps:
+  - name: corp-okta
+    issuer: https://login.example.com/oauth2/default
+    # jwks_uri omitted -> OIDC discovery
+    audiences: [ai-gateway]
+    algorithms: [RS256, ES256]        # HS*/none are rejected by validation
+    leeway_s: 30
+    jwks_cache_ttl_s: 600
+    jwks_min_refresh_interval_s: 30
+    client_id_claims: [client_id, azp, sub]
+    scope_claims: [scope, scp]
+  - name: machine-keycloak
+    issuer: https://sso.example.com/realms/machines
+    jwks_uri: https://sso.example.com/realms/machines/protocol/openid-connect/certs
+    audiences: [ai-gateway]
+
+telemetry:
+  service_name: ai-gateway
+  environment: ${GATEWAY_ENV:-dev}
+  otlp:
+    endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://localhost:4317}
+    protocol: grpc
+    headers_env: OTEL_EXPORTER_OTLP_HEADERS   # name of env var, value never in config
+  trace_sampler_ratio: 1.0
+  metrics_export_interval_s: 15
+  log_level: INFO
+  audit:
+    enabled: true
+    stdout: true
+
+defaults:
+  unknown_clients: default_limits     # or: deny
+  upstream_timeout_s: 30
+  upstream_connect_timeout_s: 5
+  on_limiter_error: fail_open
+  rate_limit:
+    requests_per_window: 600
+    window_seconds: 60
+    delay_start: 0.8                  # phase 1 from 80% of quota
+    reject_at: 1.0                    # phase 2: 429 above 100%
+    block_at: 1.5                     # phase 3 trigger: 150% ...
+    block_sustained_seconds: 30       # ... sustained for 30s
+    block_duration_seconds: 300       # cooldown
+    max_delay_ms: 2000
+    max_concurrent_delayed: 10
+    # tokens_per_window: 200000       # LLM token quota (unset = unlimited)
+    token_window_seconds: 60
+    max_concurrent_requests: 32       # in-flight requests/streams per client identity (429 above)
+    max_stream_seconds: 900           # hard cap on any response lifetime; streams also end at token expiry
+
+policy_files: ["policies/*.yaml"]
+clients_file: clients.yaml
